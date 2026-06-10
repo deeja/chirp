@@ -740,26 +740,41 @@ class BaofengUV5RHRadio(chirp_common.CloneModeRadio):
         _upload(self, self._mmap.get_packed())
 
     def _rebuild_zones(self):
-        """Regenerate the zone tables so every in-use channel is reachable.
+        """Regenerate the zone tables from per-channel zone assignments.
 
         The radio displays channels via each zone's FFFF-terminated ID list
-        (see DataProtocol.cs:1828). Chirp has no zone concept, so map channels
-        to zones naturally (zone z holds channels [z*67 .. z*67+67)) and write
-        the ID for each in-use channel, FFFF otherwise. Zone names are
+        (see DataProtocol.cs:1828). Each channel's zone is taken from
+        _zone_map (set via the per-channel Zone extra field). Zone names are
         preserved; an empty name on a populated zone gets a "Zone N" default.
         """
         mm = self._mmap
+
+        zone_channels = [[] for _ in range(ZONE_MAX)]
+        for ch_index in range(CHN_MAX):
+            if self._get_valid(ch_index):
+                z = self._zone_map[ch_index]
+                if z is not None:
+                    zone_channels[z].append(ch_index)
+
+        overloaded = [z + 1 for z in range(ZONE_MAX)
+                      if len(zone_channels[z]) > ZONE_CHN_MAX]
+        if overloaded:
+            raise errors.RadioError(
+                "Zone(s) %s exceed %d channels (firmware limit). "
+                "Reassign channels before uploading." %
+                (", ".join(str(z) for z in overloaded), ZONE_CHN_MAX))
+
         zones_used = 0
         for z in range(ZONE_MAX):
             zbase = ZONE_BASE + z * ZONE_SIZE
-            count = 0
+            channels = zone_channels[z]
+            count = len(channels)
             for idx in range(ZONE_CHN_MAX):
-                ch_index = z * ZONE_CHN_MAX + idx
                 off = zbase + 2 + idx * 2
-                if ch_index < CHN_MAX and self._get_valid(ch_index):
-                    mm[off] = (ch_index >> 8) & 0xFF   # ID high byte
-                    mm[off + 1] = ch_index & 0xFF      # ID low byte
-                    count += 1
+                if idx < count:
+                    ch_id = channels[idx]
+                    mm[off] = (ch_id >> 8) & 0xFF
+                    mm[off + 1] = ch_id & 0xFF
                 else:
                     mm[off] = 0xFF
                     mm[off + 1] = 0xFF
@@ -781,6 +796,30 @@ class BaofengUV5RHRadio(chirp_common.CloneModeRadio):
 
     def process_mmap(self):
         self._memobj = bitwise.parse(MEM_FORMAT, self._mmap)
+        self._load_zone_map()
+
+    def _load_zone_map(self):
+        """Populate _zone_map from the stored zone tables.
+
+        _zone_map[ch_index] is the 0-based zone that channel belongs to,
+        or None if the channel is not listed in any zone.
+        """
+        mm = self._mmap
+        self._zone_map = [None] * CHN_MAX
+        for z in range(ZONE_MAX):
+            zbase = ZONE_BASE + z * ZONE_SIZE
+            count = mm[zbase][0]
+            if count == 0 or count == 0xFF:
+                continue
+            for idx in range(min(count, ZONE_CHN_MAX)):
+                off = zbase + 2 + idx * 2
+                hi = mm[off][0]
+                lo = mm[off + 1][0]
+                if hi == 0xFF and lo == 0xFF:
+                    continue
+                ch_id = (hi << 8) | lo
+                if 0 <= ch_id < CHN_MAX:
+                    self._zone_map[ch_id] = z
 
     def _get_valid(self, index):
         """Channel valid flag from bitmap at 0x7A20 (bit==0 means in use).
@@ -848,6 +887,15 @@ class BaofengUV5RHRadio(chirp_common.CloneModeRadio):
         except UnicodeDecodeError:
             mem.name = name_bytes.decode('latin-1', errors='replace').rstrip()
 
+        zone_options = ["None"] + ["Zone %d" % (z + 1) for z in range(ZONE_MAX)]
+        z = self._zone_map[number - 1]
+        cur_idx = 0 if z is None else z + 1
+        rs = RadioSetting("zone", "Zone",
+                          RadioSettingValueList(zone_options,
+                                               current_index=cur_idx))
+        mem.extra = RadioSettingGroup("extra", "Extra")
+        mem.extra.append(rs)
+
         return mem
 
     def set_memory(self, mem):
@@ -898,10 +946,20 @@ class BaofengUV5RHRadio(chirp_common.CloneModeRadio):
             name_bytes = name.encode('ascii', errors='ignore')
         _mem.name = name_bytes[:16].ljust(16, b'\x00')
 
+        zone_options = ["None"] + ["Zone %d" % (z + 1) for z in range(ZONE_MAX)]
+        for setting in mem.extra:
+            if setting.get_name() == "zone":
+                z_str = str(setting.value)
+                if z_str == "None":
+                    self._zone_map[mem.number - 1] = None
+                elif z_str in zone_options:
+                    self._zone_map[mem.number - 1] = zone_options.index(z_str) - 1
+
     def get_settings(self):
         _s = self._memobj.settings
         basic = RadioSettingGroup("basic", "Basic")
-        group = RadioSettings(basic)
+        zones = RadioSettingGroup("zones", "Zones")
+        group = RadioSettings(basic, zones)
 
         def _list(key, name, options, idx):
             if idx < 0 or idx >= len(options):
@@ -943,6 +1001,25 @@ class BaofengUV5RHRadio(chirp_common.CloneModeRadio):
                           RadioSettingValueString(0, 16, cur_name))
         basic.append(rs)
 
+        mm = self._mmap
+        for z in range(ZONE_MAX):
+            off = ZONE_BASE + z * ZONE_SIZE + ZONE_NAME_OFF
+            raw = mm[off:off + 16]
+            name_bytes = bytearray()
+            for b in raw:
+                if b in (0x00, 0xFF):
+                    break
+                name_bytes.append(b)
+            try:
+                cur_zone_name = name_bytes.decode('ascii')
+            except Exception:
+                cur_zone_name = ''
+            rs = RadioSetting(
+                "zone_name_%d" % z,
+                "Zone %d name" % (z + 1),
+                RadioSettingValueString(0, 16, cur_zone_name))
+            zones.append(rs)
+
         return group
 
     def set_settings(self, settings):
@@ -973,5 +1050,13 @@ class BaofengUV5RHRadio(chirp_common.CloneModeRadio):
                 except UnicodeEncodeError:
                     nb = name.encode('ascii', errors='ignore')
                 _s.radio_name = nb[:16].ljust(16, b'\x00')
+            elif key.startswith("zone_name_"):
+                z = int(key.split("_")[-1])
+                name = str(val).strip()
+                off = ZONE_BASE + z * ZONE_SIZE + ZONE_NAME_OFF
+                encoded = name.encode('ascii', errors='replace')[:16]
+                padded = encoded.ljust(16, b'\x00')
+                for i in range(16):
+                    self._mmap[off + i] = padded[i]
             else:
                 setattr(_s, key, 1 if bool(val) else 0)
